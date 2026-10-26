@@ -1,0 +1,47 @@
+# Builds an unsigned iOS .ipa on a GitHub macOS runner.
+# Sign and install it from Windows with Sideloadly (free Apple ID works).
+# Run manually: GitHub repo -> Actions -> "iOS build" -> Run workflow.
+name: iOS build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-ios:
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.47.7
+          cache: true
+
+      - name: Versions
+        run: |
+          xcodebuild -version
+          flutter --version
+
+      - run: flutter pub get
+
+      # Release only: debug builds cannot launch on iOS without a debugger attached.
+      - name: Build Runner.app (unsigned)
+        run: flutter build ios --release --no-codesign
+
+      - name: Package .ipa
+        run: |
+          mkdir -p dist/Payload
+          cp -R build/ios/iphoneos/Runner.app dist/Payload/
+          cd dist && zip -qry my_music.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: my_music-ipa
+          path: dist/my_music.ipa
+          retention-days: 7
