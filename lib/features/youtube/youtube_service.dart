@@ -65,8 +65,39 @@ class YoutubeBlockedException implements Exception {
       'file mp3 bằng công cụ khác rồi chép vào thư mục nhạc.';
 }
 
+/// Apple Vision Pro client, copied from yt-dlp (not yet in
+/// youtube_explode_dart 3.1.0). The numeric client-name header matters: the
+/// library would otherwise send 'VISIONOS'. Needs the watch page for
+/// visitorData, or YouTube answers "Sign in to confirm you're not a bot".
+const _visionOs = YoutubeApiClient(
+  {
+    'context': {
+      'client': {
+        'clientName': 'VISIONOS',
+        'clientVersion': '1.02',
+        'deviceMake': 'Apple',
+        'deviceModel': 'RealityDevice17,1',
+        'userAgent':
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) '
+            'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 '
+            'Safari/605.1.15',
+        'osName': 'visionOS',
+        'osVersion': '26.5.23O471',
+        'hl': 'en',
+        'timeZone': 'UTC',
+        'utcOffsetMinutes': 0,
+      },
+    },
+    'contentCheckOk': true,
+    'racyCheckOk': true,
+  },
+  'https://www.youtube.com/youtubei/v1/player?prettyPrint=false',
+  headers: {'X-Youtube-Client-Name': '101'},
+);
+
 /// Wraps youtube_explode_dart. This library reverse-engineers YouTube and
-/// breaks from time to time; the fix is `flutter pub upgrade youtube_explode_dart`.
+/// breaks from time to time; the fix is `flutter pub upgrade youtube_explode_dart`
+/// or updating [_visionOs] from yt-dlp's `_base.py`.
 class YoutubeService {
   YoutubeService({required this.db, required this.paths});
 
@@ -74,7 +105,7 @@ class YoutubeService {
   final AppPaths paths;
   YoutubeExplode _yt = YoutubeExplode();
   final _http = http.Client();
-  final _audioCache = <String, AudioOnlyStreamInfo>{};
+  final _audioCache = <String, Future<AudioOnlyStreamInfo>>{};
 
   /// YouTube rejects ranges much larger than this.
   static const _chunk = 1024 * 1024;
@@ -83,7 +114,7 @@ class YoutubeService {
   Future<YoutubeVideoInfo> lookup(String link) async {
     final id = extractYoutubeId(link);
     if (id == null) throw const FormatException('Link YouTube không hợp lệ');
-    final video = await _withRetry(() => _yt.videos.get(id));
+    final video = await _withRetry((yt) => yt.videos.get(id));
     final info = YoutubeVideoInfo(
       id: id,
       title: video.title,
@@ -104,24 +135,57 @@ class YoutubeService {
   }
 
   /// Best audio-only stream in an MP4/AAC container (iOS cannot play
-  /// WebM/Opus). Cached per video; [refresh] fetches a new manifest.
-  /// Skips the watch page, which YouTube rate-limits aggressively.
-  Future<AudioOnlyStreamInfo> bestAudio(
-    String id, {
-    bool refresh = false,
-  }) async {
+  /// WebM/Opus). Cached per video, including while the fetch is in flight so
+  /// the player's parallel range requests share one manifest request;
+  /// [refresh] fetches a new manifest. Failures are not cached.
+  Future<AudioOnlyStreamInfo> bestAudio(String id, {bool refresh = false}) {
     final cached = _audioCache[id];
     if (!refresh && cached != null) return cached;
-    final manifest = await _withRetry(
-      () => _yt.videos.streamsClient.getManifest(id, requireWatchPage: false),
+    final fetch = _fetchBestAudio(id);
+    _audioCache[id] = fetch;
+    fetch.then<void>(
+      (_) {},
+      onError: (Object _) {
+        if (identical(_audioCache[id], fetch)) _audioCache.remove(id);
+      },
     );
+    return fetch;
+  }
+
+  /// Tries [_visionOs] first: its URLs serve the whole file without a PO
+  /// token, where the default client's stop after the first megabyte on many
+  /// music videos. Falls back to the default client, which skips the watch
+  /// page that YouTube rate-limits aggressively.
+  Future<AudioOnlyStreamInfo> _fetchBestAudio(String id) async {
+    try {
+      final best = _bestMp4(
+        await _yt.videos.streamsClient.getManifest(
+          id,
+          ytClients: [_visionOs],
+          requireWatchPage: true,
+        ),
+      );
+      if (best != null) return best;
+    } on YoutubeExplodeException {
+      // Fall through to the default client.
+    }
+    final best = _bestMp4(
+      await _withRetry(
+        (yt) =>
+            yt.videos.streamsClient.getManifest(id, requireWatchPage: false),
+      ),
+    );
+    if (best == null) {
+      throw StateError('Video không có luồng audio phát được trên iPhone');
+    }
+    return best;
+  }
+
+  static AudioOnlyStreamInfo? _bestMp4(StreamManifest manifest) {
     final mp4 = manifest.audioOnly.where(
       (s) => s.container == StreamContainer.mp4,
     );
-    if (mp4.isEmpty) {
-      throw StateError('Video không có luồng audio phát được trên iPhone');
-    }
-    return _audioCache[id] = mp4.withHighestBitrate();
+    return mp4.isEmpty ? null : mp4.withHighestBitrate();
   }
 
   /// Playable source for streaming without downloading.
@@ -238,13 +302,18 @@ class YoutubeService {
   }
 
   /// One retry with a fresh client: YouTube sometimes rejects a session.
-  Future<T> _withRetry<T>(Future<T> Function() run) async {
+  /// Only the first caller to fail on a client replaces it; concurrent calls
+  /// that then hit the closed client just retry on the new one.
+  Future<T> _withRetry<T>(Future<T> Function(YoutubeExplode yt) run) async {
+    final yt = _yt;
     try {
-      return await run();
+      return await run(yt);
     } on YoutubeExplodeException {
-      _yt.close();
-      _yt = YoutubeExplode();
-      return run();
+      if (identical(_yt, yt)) {
+        _yt = YoutubeExplode();
+        yt.close();
+      }
+      return run(_yt);
     }
   }
 
